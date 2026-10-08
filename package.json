@@ -1,0 +1,27 @@
+{
+  "name": "pi-extension-free-models",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "免登录、免注册、免 API Key 的免费模型通道（Zen 免密通道 + Kilo 免费池），移植自 dsh-our-free-model",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "selftest": "node --experimental-strip-types selftest.mjs"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "free-model",
+    "llm-provider",
+    "opencode-zen",
+    "kilo"
+  ],
+  "license": "MIT"
+}
