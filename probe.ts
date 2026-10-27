@@ -6,7 +6,7 @@
  *
  * @module probe
  */
-import { applyFingerprint, baseModelId, endpointFor, mintRequestId, sessionForConversation, wireFor, zenHeaders, type Wire } from "./upstream.ts";
+import { applyFingerprint, endpointFor, fingerprintStyle, sessionForConversation, wireFor, zenHeaders, type Wire } from "./upstream.ts";
 import { ZEN_BASE } from "./upstream.ts";
 
 export const STATE = {
@@ -42,8 +42,8 @@ function pingBody(modelId: string, wire: Wire): Record<string, unknown> {
 				}
 			: { model: modelId, messages: [{ role: "user", content: PING_PROMPT }], stream: true, max_tokens: 16 };
 	// 探测必须和真实回合同形，否则测的不是同一件事：免费层的 FingerprintError
-	// 同样拦探测，一个不声明 quartet 的 ping 会把能用的模型报成不可用。
-	applyFingerprint(body, wire);
+	// 同样拦探测，一个不带官方 read/shell 定义的 ping 会把能用的模型报成不可用。
+	applyFingerprint(body, fingerprintStyle(wire));
 	return body;
 }
 
@@ -63,7 +63,9 @@ function pingBody(modelId: string, wire: Wire): Record<string, unknown> {
 export async function probeModel(modelId: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<ProbeResult> {
 	const started = Date.now();
 	const wire = wireFor(modelId);
-	const session = sessionForConversation("probe:pi-free-models");
+	// 每个模型独立的上游 session。配额按 session 计数，整轮共用一个 session
+	// 会让第一个模型吃掉配额、其余模型全部读作 429（上游 issue #561）。
+	const session = sessionForConversation("probe:pi-free-models:" + modelId);
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 45000);
 	const onAbort = () => controller.abort();
@@ -76,7 +78,7 @@ export async function probeModel(modelId: string, options: { signal?: AbortSigna
 		const response = await fetch(`${ZEN_BASE}${endpointFor(modelId)}`, {
 			method: "POST",
 			headers: {
-				...zenHeaders(session, mintRequestId()),
+				...zenHeaders(session),
 				"content-type": "application/json",
 				accept: "text/event-stream",
 			},
@@ -142,7 +144,7 @@ export async function probeModel(modelId: string, options: { signal?: AbortSigna
 		};
 	} catch (error: any) {
 		return {
-			state: error?.name === "AbortError" ? STATE.unknown : STATE.unknown,
+			state: STATE.unknown,
 			detail: String(error?.message ?? error).slice(0, 200),
 			latencyMs: Date.now() - started,
 			at: Date.now(),
@@ -185,5 +187,3 @@ function stateOfStatus(status: number | undefined, body: string): ProbeState {
 export function isRoutable(state: ProbeState): boolean {
 	return state === STATE.available || state === STATE.unknown || state === STATE.throttled || state === STATE.regionBlocked;
 }
-
-export { baseModelId };

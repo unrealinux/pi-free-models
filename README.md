@@ -2,11 +2,11 @@
 
 免登录、免注册、免 API Key 的免费模型通道，装进 [Pi](https://github.com/earendil-works/pi) 就能用。
 
-移植自 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)（DeepSeek Harness 插件）的完整核心逻辑：上游 wire、模型目录、可用性探测、推理强度到真实 token 预算的映射。
+移植自 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)（DeepSeek Harness 插件）的完整核心逻辑，对应上游 2026-10 的 **v2 客户端指纹**：上游 wire、模型目录、可用性探测、思考档位到真实预算/菜单的映射。
 
 ```
-zen-free   12 个    OpenCode Zen 免密通道（Bearer public + 客户端指纹）
-kilo-free  16 个    Kilo AI 公开网关免费池（完全无凭证）
+zen-free   9 个（随 listing 变）   OpenCode 免密通道（Bearer public + v2 客户端指纹）
+kilo-free  17 个（随 listing 变）  Kilo AI 公开网关免费池（完全无凭证）
 ```
 
 ## 装
@@ -20,21 +20,21 @@ pi install https://github.com/unrealinux/pi-free-models
 开发时直接加载：
 
 ```bash
-pi -e ./index.ts --model zen-free/space-bunny-free -p "你好"
+pi -e ./index.ts --model zen-free/big-pickle -p "你好"
 ```
 
 ## 用
 
 ```
-/model zen-free/space-bunny-free
-/model kilo-free/inclusionai/ling-3.1-flash
+/model zen-free/big-pickle
+/model kilo-free/nvidia/nemotron-3.5-lightning:free
 
-/free-models      # 名单、可用性判决、各档真实 token 数
+/free-models      # 名单、可用性判决、各模型真实的档位/预算
 ```
 
 ## 免费通道的真实状态
 
-**很挤。** 实测 12 个 zen 模型里通常只有 5–7 个答得上，其余是上游 429 / 503 / 空流。这不是实现问题，是免费池本身的状态——所以「探测 → 只把真能答的放进 picker」才是这个项目的核心，而不是装饰。
+**很挤。** 免费池会整体限流（实测 429 `FreeUsageLimitError`，retry-after 数小时），这时所有 zen 模型都答不上来；也会出现单个模型 503 / 空流 / 区域拒绝。这不是实现问题，是免费池本身的状态——所以「探测 → 只把真能答的放进 picker」才是这个项目的核心，而不是装饰。限流期间模型仍然留在 picker 里，窗口恢复后不用重新配置。
 
 判决分五档，只有**网关点名拒绝**的模型才踢出 picker：
 
@@ -50,22 +50,32 @@ pi -e ./index.ts --model zen-free/space-bunny-free -p "你好"
 
 ## 移植过来的四条逻辑
 
-1. **上游 wire**（`upstream.ts`）—— `Bearer public` 池化凭证、客户端指纹头、session/request id 铸造、按模型分流 chat / responses / messages、tool quartet 门禁。
-2. **模型目录**（`catalog.ts`）—— 上游 listing 只给一个 id，能力表补上下文 / 视觉 / 推理；listing 混着付费 id，`isFreeLane` 只留免费层。
-3. **可用性探测**（`probe.ts`）—— 用能产生判决的最小请求去问，而不是相信 listing。
-4. **强度 → 真实预算**（`effort.ts`）—— 网关接受 `reasoning_effort` / `thinking.budget_tokens` / `enable_thinking` 然后**全部忽略**（实测 `low` 产生的思考 token 比 `xhigh` 还多），唯一被执行的只有 `max_tokens`。Pi 的六档思考等级映射到 2048 / 2048 / 8192 / 8192 / 容量 / 容量，关不掉思考的模型整条阶梯翻倍。
+1. **上游 wire**（`upstream.ts`）—— `Bearer public` 池化凭证、v2 客户端指纹、规范 session 编码、按模型分流 chat / responses / messages、`read` + `shell` 门禁。
+2. **模型目录**（`catalog.ts`）—— 上游 listing 只给一个 id，能力表补上下文 / 视觉 / 推理 / 思考菜单；listing 混着付费 id，`isFreeLane` 只留免费层。
+3. **可用性探测**（`probe.ts`）—— 用能产生判决的最小请求去问，而不是相信 listing；每个模型一个独立 session，并发压到 2。
+4. **档位 → 真实控制**（`effort.ts`）—— 两种模式：
+   - 声明了 `efforts` 菜单的模型（deepseek / glm / nemotron VL / space-bunny / Kilo 的推理模型）：选中的档位作为 `reasoning_effort`（Kilo 是 `reasoning.effort`）真的发出去，网关会校验并执行，预算用模型容量。
+   - 没有菜单的模型：继续走 token 阶梯。Pi 的六档映射到 2048 / 2048 / 8192 / 8192 / 容量 / 容量，关不掉思考的模型整条阶梯翻倍。
 
-## tool quartet 指纹门禁
+Pi 会在调用 provider 前把 `off` 折成 `undefined`，所以「关掉思考」在扩展这条路上无法表达：菜单模型落到自己声明的默认档（多为 high），没有菜单的模型落到 medium 预算。
 
-Zen 免费层要求请求里声明 `bash` / `glob` / `grep` / `read` 四个工具名。Pi 自带 `bash` / `grep` / `read`，缺的 `glob` 由真实工具 `find` 顶替——门禁只看声明的名字，而响应侧会把名字还原回 `find`，让调用回来是可执行的而不是一个死诱饵。只有实在没有供体的会话才补一个自述不可用的替身。
+## v2 指纹门禁
 
-**这本质上是伪造客户端指纹。** 上游随时可能收紧（实测已经出现过 `FreeTierError: OpenCode's free tier can only be used from within OpenCode`），收紧后这条通道就会失效。
+免费层要求请求里**逐字**声明官方客户端的 `read` 与 `shell`：description 和参数 schema 必须与 OpenCode v2.0.26 一致，改写措辞、精简 schema 都会换来 403 `FreeTierError`。
+
+- 调用方的工具原样保留；名字正好是 `read` / `shell` 但定义不同的，改名为 `read_client` / `shell_client`，历史调用与 `tool_choice` 同步改名，响应侧再还原。
+- 注入的官方 `shell` 在响应侧还原成 Pi 的 `bash`，让调用回来是可执行的；并在系统提示里说明注入项是占位物，别去调它。
+- **绝不下发 `tool_choice: "none"`** —— v2 见到就 403；v1 的 `bash` / `glob` / `grep` / `read` 四件套与 `x-opencode-request` 头都已失效。
+
+**这本质上是伪造客户端指纹。** 上游随时可能收紧（`/zen/v1` → `/inference/v1` 就是这么发生的），收紧后这条通道就会失效。
 
 ## 移植时修掉的上游缺陷
 
-1. **探测没带 quartet** → 12 个模型里 11 个被 `FreeTierError` 误报。带上后可用数从 1 涨到 7。
+1. **探测没带门禁工具** → 多数模型被 `FreeTierError` 误报成不可用。
 2. **`400` 带 `"type":"server_error"`** → 网关在说它自己那段挂了（`Upstream request failed: Endpoint is unavailable`），不是点名模型，却会被判死。
 3. **`200` 但整条流零 delta** → 「头说 200、体里只有 `{"choices":[],"cost":"0"}`」那种谎，不该给绿徽章，降为 `unknown`（仍可路由）。
+4. **所有探测共用一个 session** → 配额按 session 计，第一个模型吃掉额度、其余全部读作 429。现在每个模型一个 session。
+5. **快照未校验** → 旧版本或被写坏的快照会让字段缺失的行炸进 picker。现在逐行校验，坏的丢掉。
 
 ## 与上游插件的差异
 
@@ -73,8 +83,9 @@ Zen 免费层要求请求里声明 `bash` / `glob` / `grep` / `read` 四个工�
 |---|---|---|
 | 公告推送 / token 热力图 / 自升级 / EAC 协付 / vault / forward 端口 | 有（4000+ 行设置页） | 无，用 `/free-models` 一行命令替代 |
 | picker 分组 | 两组 | Pi 没有分组概念，靠名字后缀 `· region-limited` |
-| `glob` 槽位供体 | `pwsh` → `bash` | `find` → `glob` |
-| 强度档位 | Light / Balanced / Deep | Pi 的六档思考等级，同一套 token 预算 |
+| 门禁槽位供体 | `pwsh` → `bash`（v1） | `read` / `shell` 官方定义 + 调用方工具改名（v2） |
+| 强度档位 | Light / Balanced / Deep | Pi 的六档；有菜单的模型下发真实档位，没有的走 token 阶梯 |
+| 探测扇出 | 并发 2 | 并发 2，每个模型独立 session |
 
 ## 自检
 
@@ -82,7 +93,7 @@ Zen 免费层要求请求里声明 `bash` / `glob` / `grep` / `read` 四个工�
 npm run selftest
 ```
 
-会真的打上游：验证 id 铸造、endpoint 分流、指纹门禁、预算阶梯，抓一次 listing、逐个探测、最后写快照。需要 Node >= 22.6（`--experimental-strip-types`）。
+会真的打上游：验证 session 编码、endpoint 分流、v2 指纹门禁、思考菜单、预算阶梯，抓一次 listing、逐个探测、最后写快照。免费池整体限流时自检仍然通过，只记录可用数（0 可用是上游状态，不是实现问题）。需要 Node >= 22.6（`--experimental-strip-types`）。
 
 ## 免责声明
 

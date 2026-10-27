@@ -2,8 +2,8 @@
  * Pi 版 dsh-our-free-model —— 免登录、免注册、免 API Key 的免费模型通道。
  *
  * 移植自 https://github.com/Ebony-Vinyl/dsh-our-free-model 的完整逻辑：
- * 上游 wire（指纹头 / session 铸造 / 按模型分 endpoint / tool quartet 门禁）、
- * 模型目录与能力表、可用性探测与判决、推理强度到真实 token 预算的映射。
+ * 上游 wire（v2 指纹头 / 规范 session / 按模型分 endpoint / read+shell 门禁）、
+ * 模型目录与能力表、可用性探测与判决、推理强度到真实预算/菜单的映射。
  *
  * 承载方式是 Pi 的 provider extension：`pi.registerProvider` + `streamSimple`
  * 委托给 pi-ai 自带的 API 实现，所以请求编码、工具调用、用量记账、取消、
@@ -30,12 +30,12 @@ import { join } from "node:path";
 
 import { loadSnapshot as loadSnapshotFile, saveSnapshot as saveSnapshotFile } from "./snapshot.ts";
 import { buildCatalog, buildKiloCatalog, KILO_BASE, parseListing, type CatalogEntry, type KiloEntry } from "./catalog.ts";
-import { budgetFor, budgetLadder, normalizeLevel } from "./effort.ts";
+import { budgetFor, budgetLadder, effortPatchFor, hasEffortMenu, normalizeLevel, thinkingLevelMapFor } from "./effort.ts";
 import { isRoutable, probeModel, type ProbeState } from "./probe.ts";
 import {
 	applyFingerprint,
-	mintRequestId,
-	QUARTET,
+	FINGERPRINT_TOOLS,
+	fingerprintStyle,
 	sessionForConversation,
 	wireFor,
 	ZEN_API_BASE,
@@ -54,7 +54,7 @@ const LISTING_TIMEOUT_MS = 15000;
 /** 探测结果与能力表：id -> 判决。picker 的成员资格由它决定。 */
 const verdicts = new Map<string, { state: ProbeState; detail?: string; at: number }>();
 const capabilityIndex = new Map<string, CatalogEntry>();
-const kiloCapabilityIndex = new Map<string, { canDisableThinking: boolean; maxOutput: number }>();
+const kiloCapabilityIndex = new Map<string, KiloEntry>();
 
 /** 刷新失败时保留上一轮名单，而不是把它清空。 */
 let zenCache: CatalogEntry[] = [];
@@ -68,23 +68,42 @@ let kiloCache: KiloEntry[] = [];
  * 也就是项目里“远端目录保留一份快照以供离线启动”那条。
  */
 const SNAPSHOT = join(getAgentDir(), "free-models-catalog.json");
+const VALID_STATES = new Set(["available", "region-blocked", "unavailable", "throttled", "unknown"]);
+
+/** 快照可能来自旧版本或被写坏；字段不全的行直接丢掉，而不是让它炸在 picker 里。 */
+function usableEntry(value: any): boolean {
+	return value !== null && typeof value === "object"
+		&& typeof value.id === "string" && value.id !== ""
+		&& Number.isFinite(value.contextWindow) && Number.isFinite(value.maxOutput);
+}
+
 function loadSnapshot() {
 	const saved = loadSnapshotFile(SNAPSHOT);
 	if (!saved) return;
-	zenCache = saved.zen as CatalogEntry[];
-	kiloCache = saved.kilo as KiloEntry[];
-	for (const [id, verdict] of Object.entries(saved.verdicts)) verdicts.set(id, verdict as any);
+	zenCache = saved.zen.filter(usableEntry) as CatalogEntry[];
+	kiloCache = saved.kilo.filter(usableEntry) as KiloEntry[];
+	for (const [id, verdict] of Object.entries(saved.verdicts)) {
+		const state = (verdict as any)?.state;
+		if (typeof state === "string" && VALID_STATES.has(state)) verdicts.set(id, verdict as any);
+	}
 }
 function saveSnapshot() {
 	saveSnapshotFile(SNAPSHOT, { zen: zenCache, kilo: kiloCache, verdicts: Object.fromEntries(verdicts) });
 }
 
+/**
+ * Provider 级 api。Pi 只在 `model.api === extension.api` 时才调用本扩展的
+ * `streamSimple`，所以每个 zen 模型的 `api` 都必须填这个值；真实的 wire
+ * 由 `streamZen` 按模型 id 选择。
+ */
+const ZEN_API = "openai-completions" as Api;
+
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 /**
- * 免费层要求声明四个工具名；聊天通道用 `max_tokens`，且网关忽略
- * `reasoning_effort`（实测：`low` 产生的思考比 `xhigh` 还多），所以关掉它，
- * 预算完全交给 `maxTokens`。
+ * 聊天通道用 `max_tokens`，并关掉 Pi 自带的 `reasoning_effort` 注入：
+ * 有思考菜单的模型由 `effortPatchFor` 精确下发声明集合里的值，
+ * 没有菜单的模型只靠 `maxTokens`。
  */
 const CHAT_COMPAT = {
 	maxTokensField: "max_tokens" as const,
@@ -116,22 +135,30 @@ function compatFor(wire: Wire): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 async function fetchZenCatalog(signal: AbortSignal): Promise<CatalogEntry[]> {
-	const response = await fetch(`${ZEN_BASE}/zen/v1/models`, {
-		headers: { ...zenHeaders(sessionForConversation("listing:zen"), mintRequestId()), accept: "application/json" },
+	const response = await fetch(`${ZEN_BASE}/inference/v1/models`, {
+		headers: { ...zenHeaders(sessionForConversation("listing:zen")), accept: "application/json" },
 		signal,
 	});
 	if (!response.ok) throw new Error(`zen listing HTTP ${response.status}`);
 	return buildCatalog(parseListing(await response.json()));
 }
 
-/** 并发探测，单个失败不影响其余；判决写进 verdicts。 */
+/**
+ * 探测，单个失败不影响其余；判决写进 verdicts。
+ *
+ * 并发压到 2：这条车道按 session 计配额，一口气打完会让探测自己撞上 429，
+ * 判决全部退化成 throttled，探测就失去了分辨力（上游 probeCatalog 同样如此）。
+ */
 async function probeAll(entries: CatalogEntry[], signal: AbortSignal): Promise<void> {
-	await Promise.allSettled(
-		entries.map(async (entry) => {
+	const queue = [...entries];
+	const workers = Array.from({ length: Math.min(2, queue.length) }, async () => {
+		while (queue.length > 0) {
+			const entry = queue.shift()!;
 			const result = await probeModel(entry.id, { signal, timeoutMs: PROBE_TIMEOUT_MS });
 			verdicts.set(entry.id, { state: result.state, detail: result.detail, at: result.at });
-		}),
-	);
+		}
+	});
+	await Promise.all(workers);
 }
 
 /**
@@ -150,12 +177,13 @@ function zenModels(): ProviderModelConfig[] {
 			return {
 				id: entry.id,
 				name: regionLimited ? `${entry.name} · region-limited` : entry.name,
-				api: apiIdFor(entry.wire),
+				api: ZEN_API,
 				reasoning: entry.reasoning,
 				input: (entry.vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
 				cost: ZERO_COST,
 				contextWindow: entry.contextWindow,
 				maxTokens: entry.maxOutput,
+				thinkingLevelMap: thinkingLevelMapFor(entry) as any,
 				compat: compatFor(entry.wire) as any,
 			};
 		});
@@ -167,24 +195,26 @@ function streamZen(model: Model<Api>, context: TranscriptContext, options?: Simp
 		try {
 			const wire = wireFor(model.id);
 			const session = sessionForConversation(options?.sessionId);
-			const requestId = mintRequestId();
 			const entry = capabilityIndex.get(model.id);
 			const canDisableThinking = entry?.canDisableThinking !== false;
-			const budget = budgetFor(normalizeLevel(options?.reasoning), model.maxTokens, canDisableThinking);
+			const menu = hasEffortMenu(entry) ? entry : undefined;
+			const budget = budgetFor(normalizeLevel(options?.reasoning), model.maxTokens, canDisableThinking, options?.maxTokens, menu !== undefined);
 
-			// 指纹门禁把 `glob` 槽位交给 Pi 的 `find`，响应侧要还原成调用方的拼写，
-			// 否则 Pi 收到一个它没有的工具名。
+			// 响应侧要还原指纹门禁改过的工具名，否则 Pi 收到一个它没有的工具名。
 			const nameMap = new Map<string, string>();
 
-			const inner = implFor(wire).streamSimple(model, context, {
+			// 用 wire 自己的 api 跑实现，让产出消息记的是真正跑过的协议。
+			const inner = implFor(wire).streamSimple({ ...model, api: apiIdFor(wire) }, context, {
 				...options,
 				apiKey: "public",
-				headers: zenHeaders(session, requestId),
+				headers: zenHeaders(session),
 				maxTokens: budget,
 				onPayload: async (payload, forModel) => {
 					const replaced = options?.onPayload ? await options.onPayload(payload, forModel) : undefined;
 					const body = (replaced ?? payload) as Record<string, unknown>;
-					for (const [sent, original] of applyFingerprint(body, wire)) nameMap.set(sent, original);
+					const patch = effortPatchFor(menu, options?.reasoning);
+					if (patch !== undefined) Object.assign(body, patch);
+					for (const [sent, original] of applyFingerprint(body, fingerprintStyle(wire))) nameMap.set(sent, original);
 					return body;
 				},
 			});
@@ -214,7 +244,7 @@ async function fetchKiloCatalog(signal: AbortSignal): Promise<KiloEntry[]> {
 
 function kiloModels(): ProviderModelConfig[] {
 	return kiloCache.map((entry) => {
-		kiloCapabilityIndex.set(entry.id, { canDisableThinking: entry.canDisableThinking, maxOutput: entry.maxOutput });
+		kiloCapabilityIndex.set(entry.id, entry);
 		return {
 			id: entry.id,
 			name: entry.name,
@@ -224,6 +254,7 @@ function kiloModels(): ProviderModelConfig[] {
 			cost: ZERO_COST,
 			contextWindow: entry.contextWindow,
 			maxTokens: entry.maxOutput,
+			thinkingLevelMap: thinkingLevelMapFor(entry) as any,
 			compat: { ...CHAT_COMPAT } as any,
 		};
 	});
@@ -238,7 +269,8 @@ function streamKilo(model: Model<Api>, context: TranscriptContext, options?: Sim
 	void (async () => {
 		try {
 			const entry = kiloCapabilityIndex.get(model.id);
-			const budget = budgetFor(normalizeLevel(options?.reasoning), model.maxTokens, entry?.canDisableThinking !== false);
+			const menu = hasEffortMenu(entry) ? entry : undefined;
+			const budget = budgetFor(normalizeLevel(options?.reasoning), model.maxTokens, entry?.canDisableThinking !== false, options?.maxTokens, menu !== undefined);
 			const inner = openAICompletionsApi().streamSimple(model, context, {
 				...options,
 				// apiKey 必须在 provider 层留着，否则 Pi 视其为未配置、模型不进 picker；
@@ -246,6 +278,14 @@ function streamKilo(model: Model<Api>, context: TranscriptContext, options?: Sim
 				// （传 `null` 就是抑制同名默认头）—— 带上它反而 401 INVALID_TOKEN。
 				headers: { Authorization: null, authorization: null, "user-agent": "pi-free-models" } as any,
 				maxTokens: budget,
+				onPayload: async (payload, forModel) => {
+					const replaced = options?.onPayload ? await options.onPayload(payload, forModel) : undefined;
+					const body = (replaced ?? payload) as Record<string, unknown>;
+					// Kilo 执行 OpenRouter 的 `reasoning` 对象；菜单里的档位才是真的控制项。
+					const patch = effortPatchFor(menu, options?.reasoning);
+					if (patch !== undefined) Object.assign(body, patch);
+					return body;
+				},
 			});
 			for await (const event of inner) stream.push(event);
 			stream.end();
@@ -302,8 +342,8 @@ export default async function (pi: ExtensionAPI) {
 		name: "Zen Free",
 		baseUrl: ZEN_API_BASE,
 		apiKey: "public",
-		api: "openai-completions" as Api,
-		headers: { "user-agent": ZEN_UA, "x-opencode-client": "desktop", "x-opencode-project": "global" },
+		api: ZEN_API,
+		headers: { "user-agent": ZEN_UA },
 		models: zenModels(),
 		streamSimple: streamZen,
 		async refreshModels(context) {
@@ -356,15 +396,17 @@ export default async function (pi: ExtensionAPI) {
 				}
 				for (const entry of list) {
 					const verdict = verdicts.get(entry.id);
-					const caps = budgetLadder(entry.maxOutput, (entry as CatalogEntry).canDisableThinking !== false);
-					const ladder = caps.map((rung) => `${rung.level[0]}${rung.tokens}`).join(" ");
+					const menu = (entry as CatalogEntry | KiloEntry).efforts;
+					const detail = menu !== undefined && menu.length > 0
+						? `menu ${menu.join("/")}`
+						: budgetLadder(entry.maxOutput, (entry as CatalogEntry).canDisableThinking !== false).map((rung) => `${rung.level[0]}${rung.tokens}`).join(" ");
 					const hidden = verdict !== undefined && !isRoutable(verdict.state) ? "  [不进 picker]" : "";
-					lines.push(`  ${entry.id.padEnd(36)} ${stamp(verdict?.state).padEnd(14)} max=${entry.maxOutput}  ${ladder}${hidden}`);
+					lines.push(`  ${entry.id.padEnd(36)} ${stamp(verdict?.state).padEnd(14)} max=${entry.maxOutput}  ${detail}${hidden}`);
 					if (verdict?.detail) lines.push(`      ${verdict.detail}`);
 				}
 			}
 			lines.push("");
-			lines.push(`指纹门禁要求的工具名：${QUARTET.join(" / ")}（Pi 的 find 会顶替 glob 槽位）`);
+			lines.push(`指纹门禁要求的工具名：${FINGERPRINT_TOOLS.join(" / ")}（官方定义逐字，缺一即 403）`);
 			lines.push("免费池的 prompt 可能被上游记录，别发敏感内容。");
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
