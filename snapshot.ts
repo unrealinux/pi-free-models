@@ -15,6 +15,9 @@ export interface Snapshot {
 	zen: unknown[];
 	kilo: unknown[];
 	verdicts: Record<string, unknown>;
+	/** 探测暂停到什么时候；重启后仍生效，避免一启动就白烧一轮额度。 */
+	probeBackoffUntil?: number;
+	probeThrottleStreak?: number;
 	at?: number;
 }
 
@@ -25,6 +28,8 @@ export function loadSnapshot(path: string): Snapshot | undefined {
 			zen: Array.isArray(saved.zen) ? saved.zen : [],
 			kilo: Array.isArray(saved.kilo) ? saved.kilo : [],
 			verdicts: saved.verdicts && typeof saved.verdicts === "object" ? saved.verdicts : {},
+			...(typeof saved.probeBackoffUntil === "number" ? { probeBackoffUntil: saved.probeBackoffUntil } : {}),
+			...(typeof saved.probeThrottleStreak === "number" ? { probeThrottleStreak: saved.probeThrottleStreak } : {}),
 			at: saved.at,
 		};
 	} catch {

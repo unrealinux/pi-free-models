@@ -24,6 +24,8 @@ export interface ProbeResult {
 	detail?: string;
 	latencyMs: number;
 	ttftMs?: number;
+	/** 上游 `Retry-After` 换算的毫秒数；429 时用来决定探测暂停多久。 */
+	retryAfterMs?: number;
 	at: number;
 }
 
@@ -88,7 +90,13 @@ export async function probeModel(modelId: string, options: { signal?: AbortSigna
 
 		if (!response.ok) {
 			const text = await response.text().catch(() => "");
-			return { state: stateOfStatus(response.status, text), detail: text.slice(0, 200), latencyMs: Date.now() - started, at: Date.now() };
+			return {
+				state: stateOfStatus(response.status, text),
+				detail: text.slice(0, 200),
+				retryAfterMs: retryAfterMs(response.headers.get("retry-after")),
+				latencyMs: Date.now() - started,
+				at: Date.now(),
+			};
 		}
 
 		const reader = response.body?.getReader();
@@ -153,6 +161,35 @@ export async function probeModel(modelId: string, options: { signal?: AbortSigna
 		clearTimeout(timer);
 		options.signal?.removeEventListener("abort", onAbort);
 	}
+}
+
+/**
+ * `Retry-After` 的秒数形式。HTTP 日期形式在这个网关上没出现过，忽略即可。
+ */
+export function retryAfterMs(value: string | null): number | undefined {
+	const seconds = Number(value);
+	return Number.isFinite(seconds) && seconds > 0 ? Math.trunc(seconds * 1000) : undefined;
+}
+
+/** 整轮全 429 时探测暂停多久：30 分钟起，连续失败翻倍，上限 120 分钟。 */
+const THROTTLE_BACKOFF_START_MS = 30 * 60 * 1000;
+const THROTTLE_BACKOFF_MAX_MS = 120 * 60 * 1000;
+
+export function throttleBackoffMs(streak: number): number {
+	const step = Math.max(1, Math.trunc(streak));
+	return Math.min(THROTTLE_BACKOFF_START_MS * 2 ** (step - 1), THROTTLE_BACKOFF_MAX_MS);
+}
+
+/**
+ * 这一轮读数是不是"车道被锁"：全部是 429 或区域限制，且至少有一个 429。
+ *
+ * 只看 `allThrottled` 会被稳定的区域限制模型阻止（它们永远不是 429），
+ * 于是锁定时也会每轮重探。加入 available / unknown 就重置暂停：那是真的变化。
+ */
+export function probeRoundLocked(states: ProbeState[]): boolean {
+	return states.length > 0
+		&& states.some((state) => state === STATE.throttled)
+		&& states.every((state) => state === STATE.throttled || state === STATE.regionBlocked);
 }
 
 /**

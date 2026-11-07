@@ -7,7 +7,7 @@
 import { join } from "node:path";
 import { buildCatalog, buildKiloCatalog, parseListing } from "./catalog.ts";
 import { budgetFor, effortPatchFor, normalizeLevel, thinkingLevelMapFor } from "./effort.ts";
-import { isRoutable, probeModel, STATE } from "./probe.ts";
+import { isRoutable, probeModel, probeRoundLocked, retryAfterMs, STATE, throttleBackoffMs } from "./probe.ts";
 import {
 	applyFingerprint,
 	canonicalizeSession,
@@ -144,6 +144,9 @@ check("Deep 档在容量低于档位时跟着容量", budgetFor("max", 4096, tru
 check("未知档位落到默认（均衡）", budgetFor(undefined, 32768, true) === normalMid);
 check("预算不低于最低值", budgetFor("low", 100, true) === 512);
 check("调用方的上限只能压低预算", budgetFor("max", 32768, true, 4096) === 4096);
+check("retry-after 秒转毫秒", retryAfterMs("77722") === 77722000 && retryAfterMs(null) === undefined);
+check("探测退避 30/60/120 分钟封顶", [1, 2, 3, 99].map(throttleBackoffMs).join(",") === [1800000, 3600000, 7200000, 7200000].join(","));
+check("全 429/区域限制才算车道锁定", probeRoundLocked(["throttled", "region-blocked"]) && !probeRoundLocked(["throttled", "available"]) && !probeRoundLocked(["region-blocked"]) && !probeRoundLocked([]));
 check("off 档落到最小预算", normalizeLevel("off") === "minimal" && budgetFor("minimal", 32768, true) === 2048);
 check("有菜单的模型预算 = 容量", budgetFor("low", 384000, true, undefined, true) === 384000);
 
@@ -225,7 +228,7 @@ for (const entry of liveCatalog) {
 	const result = await probeModel(entry.id, { timeoutMs: 12000 });
 	zenVerdicts[entry.id] = { state: result.state, detail: result.detail, at: result.at };
 	if (result.state === STATE.available) available += 1;
-	console.log(`      ${entry.id.padEnd(34)} ${result.state.padEnd(15)} ${result.detail ?? ""}`);
+	console.log(`      ${entry.id.padEnd(34)} ${result.state.padEnd(15)} ${result.detail ?? ""}${result.retryAfterMs ? ` [retry-after ${Math.round(result.retryAfterMs / 60000)}min]` : ""}`);
 }
 const validStates = new Set(Object.values(STATE));
 check("每个模型都拿到合法判决", Object.values(zenVerdicts).every((v) => validStates.has(v.state)));

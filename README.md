@@ -29,7 +29,8 @@ pi -e ./index.ts --model zen-free/big-pickle -p "你好"
 /model zen-free/big-pickle
 /model kilo-free/nvidia/nemotron-3.5-lightning:free
 
-/free-models      # 名单、可用性判决、各模型真实的档位/预算
+/free-models      # 名单、可用性判决、探测暂停、各模型真实的档位/预算
+/free-models reprobe   # 强制重探一轮（暂停窗口内也能用）
 ```
 
 ## 免费通道的真实状态
@@ -47,6 +48,8 @@ pi -e ./index.ts --model zen-free/big-pickle -p "你好"
 | `unavailable` | 网关点名拒绝这个模型 | ❌ |
 
 不对称是刻意的：picker 里一条过期记录只让用户损失一个可以重试的回合，而一个因为抖动消失的模型要用户走一遍他看不见的「重新探测再等待」周期。
+
+整轮探测全是 429 时，探测会自动暂停 30 分钟；连续失败翻倍到 120 分钟封顶。`/free-models` 会显示还剩多久，以及上游给的 `retry-after`。暂停只影响探测，你的正常请求和 picker 里的模型都不受影响；`/free-models reprobe` 可以强制一轮。
 
 ## 移植过来的四条逻辑
 

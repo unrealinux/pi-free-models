@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { loadSnapshot as loadSnapshotFile, saveSnapshot as saveSnapshotFile } from "./snapshot.ts";
 import { buildCatalog, buildKiloCatalog, KILO_BASE, parseListing, type CatalogEntry, type KiloEntry } from "./catalog.ts";
 import { budgetFor, budgetLadder, effortPatchFor, hasEffortMenu, normalizeLevel, thinkingLevelMapFor } from "./effort.ts";
-import { isRoutable, probeModel, type ProbeState } from "./probe.ts";
+import { isRoutable, probeModel, probeRoundLocked, throttleBackoffMs, type ProbeState } from "./probe.ts";
 import {
 	applyFingerprint,
 	FINGERPRINT_TOOLS,
@@ -52,9 +52,17 @@ const PROBE_TIMEOUT_MS = 8000;
 const LISTING_TIMEOUT_MS = 15000;
 
 /** 探测结果与能力表：id -> 判决。picker 的成员资格由它决定。 */
-const verdicts = new Map<string, { state: ProbeState; detail?: string; at: number }>();
+const verdicts = new Map<string, { state: ProbeState; detail?: string; retryAfterMs?: number; at: number }>();
 const capabilityIndex = new Map<string, CatalogEntry>();
 const kiloCapabilityIndex = new Map<string, KiloEntry>();
+
+/**
+ * 车道被锁时暂停探测：一轮读数全是 429 / 区域限制就暂停 30 分钟，
+ * 连续失败翻倍到 120 分钟封顶（上游 `runProbeRound` 同款）。
+ * 免费池的锁定窗口常以小时计，每次打开 /model 都重探只会白烧额度。
+ */
+let probeBackoffUntil = 0;
+let probeThrottleStreak = 0;
 
 /** 刷新失败时保留上一轮名单，而不是把它清空。 */
 let zenCache: CatalogEntry[] = [];
@@ -86,9 +94,17 @@ function loadSnapshot() {
 		const state = (verdict as any)?.state;
 		if (typeof state === "string" && VALID_STATES.has(state)) verdicts.set(id, verdict as any);
 	}
+	if (typeof saved.probeBackoffUntil === "number") probeBackoffUntil = saved.probeBackoffUntil;
+	if (typeof saved.probeThrottleStreak === "number") probeThrottleStreak = saved.probeThrottleStreak;
 }
 function saveSnapshot() {
-	saveSnapshotFile(SNAPSHOT, { zen: zenCache, kilo: kiloCache, verdicts: Object.fromEntries(verdicts) });
+	saveSnapshotFile(SNAPSHOT, {
+		zen: zenCache,
+		kilo: kiloCache,
+		verdicts: Object.fromEntries(verdicts),
+		probeBackoffUntil,
+		probeThrottleStreak,
+	});
 }
 
 /**
@@ -155,10 +171,20 @@ async function probeAll(entries: CatalogEntry[], signal: AbortSignal): Promise<v
 		while (queue.length > 0) {
 			const entry = queue.shift()!;
 			const result = await probeModel(entry.id, { signal, timeoutMs: PROBE_TIMEOUT_MS });
-			verdicts.set(entry.id, { state: result.state, detail: result.detail, at: result.at });
+			verdicts.set(entry.id, { state: result.state, detail: result.detail, retryAfterMs: result.retryAfterMs, at: result.at });
 		}
 	});
 	await Promise.all(workers);
+	// 被 picker 的 15s 预算切断的轮次不足以说明额度状态，不要改暂停窗口。
+	if (signal.aborted) return;
+	const states = entries.map((entry) => verdicts.get(entry.id)?.state);
+	if (!probeRoundLocked(states.filter((state): state is ProbeState => state !== undefined))) {
+		probeThrottleStreak = 0;
+		probeBackoffUntil = 0;
+		return;
+	}
+	probeThrottleStreak += 1;
+	probeBackoffUntil = Date.now() + throttleBackoffMs(probeThrottleStreak);
 }
 
 /**
@@ -352,7 +378,8 @@ export default async function (pi: ExtensionAPI) {
 			const signal = AbortSignal.any([context.signal, timer]);
 			try {
 				zenCache = await fetchZenCatalog(signal);
-				await probeAll(zenCache, signal);
+				// 暂停窗口内只刷新名单，不探模型；context.force（Pi 的强制刷新）除外。
+				if (context.force === true || probeBackoffUntil <= Date.now()) await probeAll(zenCache, signal);
 				saveSnapshot();
 			} catch {
 				// 拉不到就保留上一轮名单，而不是把它们清空。
@@ -383,10 +410,24 @@ export default async function (pi: ExtensionAPI) {
 
 	/** 设置页 4036 行的替代品：名单、判决、真实预算数字，一行一个模型。 */
 	pi.registerCommand("free-models", {
-		description: "免费通道状态：模型名单、可用性判决、各档真实 token 预算",
-		handler: async (_args, ctx) => {
+		description: "免费通道状态：模型名单、可用性判决、探测暂停、各模型真实的档位/预算",
+		handler: async (args, ctx) => {
+			const force = String(args ?? "").trim().toLowerCase() === "reprobe";
+			if (force) {
+				probeThrottleStreak = 0;
+				probeBackoffUntil = 0;
+				if (zenCache.length > 0) {
+					await probeAll(zenCache, AbortSignal.timeout(PROBE_TIMEOUT_MS * Math.ceil(zenCache.length / 2) + 5000));
+					saveSnapshot();
+				}
+			}
 			const lines: string[] = [];
 			const stamp = (state: ProbeState | undefined) => (state === undefined ? "未探测" : state);
+			const minutes = (ms: number) => Math.max(1, Math.round(ms / 60000));
+			if (probeBackoffUntil > Date.now()) {
+				lines.push(`探测暂停：还有 ${minutes(probeBackoffUntil - Date.now())} 分钟（连续 ${probeThrottleStreak} 轮全 429；/free-models reprobe 强制重探）`);
+				lines.push("");
+			}
 			for (const id of [ZEN_PROVIDER, KILO_PROVIDER]) {
 				lines.push(`── ${id} ──`);
 				const list = id === ZEN_PROVIDER ? zenCache : kiloCache;
@@ -401,12 +442,14 @@ export default async function (pi: ExtensionAPI) {
 						? `menu ${menu.join("/")}`
 						: budgetLadder(entry.maxOutput, (entry as CatalogEntry).canDisableThinking !== false).map((rung) => `${rung.level[0]}${rung.tokens}`).join(" ");
 					const hidden = verdict !== undefined && !isRoutable(verdict.state) ? "  [不进 picker]" : "";
-					lines.push(`  ${entry.id.padEnd(36)} ${stamp(verdict?.state).padEnd(14)} max=${entry.maxOutput}  ${detail}${hidden}`);
+					const retry = verdict?.retryAfterMs ? `  retry-after ${minutes(verdict.retryAfterMs)}min` : "";
+					lines.push(`  ${entry.id.padEnd(36)} ${stamp(verdict?.state).padEnd(14)} max=${entry.maxOutput}  ${detail}${hidden}${retry}`);
 					if (verdict?.detail) lines.push(`      ${verdict.detail}`);
 				}
 			}
 			lines.push("");
 			lines.push(`指纹门禁要求的工具名：${FINGERPRINT_TOOLS.join(" / ")}（官方定义逐字，缺一即 403）`);
+			lines.push("探测退避：整轮全 429 时暂停 30→120 分钟；/free-models reprobe 强制一轮。");
 			lines.push("免费池的 prompt 可能被上游记录，别发敏感内容。");
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
